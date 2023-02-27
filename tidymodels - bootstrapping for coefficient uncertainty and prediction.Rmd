@@ -1,0 +1,313 @@
+---
+title: "tidymodels - bootstrapping for coefficient uncertainty & prediction"
+author: "Patrick Ward"
+date: "2/25/2023"
+output: html_document
+---
+
+## Load Packages & Data
+
+```{r}
+## packages
+library(tidyverse)
+library(Lahman)
+library(tidymodels)
+library(broom)
+
+theme_set(theme_light())
+
+## data
+d <- Batting %>%
+  filter(yearID >= 2010) %>%
+  select(playerID, yearID, AB, R, H) %>%
+  group_by(playerID, yearID) %>%
+  summarize(across(.cols = everything(),
+                   ~sum(.x)),
+            .groups = "drop") %>%
+  filter(AB >= 200)
+
+d %>%
+  head() %>%
+  knitr::kable()
+
+```
+
+
+## EDA
+
+**plot**
+
+```{r}
+d %>%
+  select(AB:H) %>%
+  pivot_longer(cols = everything()) %>%
+  ggplot(aes(x = value, fill = name)) +
+  geom_histogram(color = "black", 
+                 show.legend = FALSE) +
+  facet_wrap(~name, scales = "free_x",
+             nrow = 2,
+             ncol = 2) +
+  theme(strip.background = element_rect(fill = "black"),
+        strip.text = element_text(color = "white", face = "bold"))
+```
+
+
+**summary statistics**
+
+```{r}
+d %>%
+  select(AB:H) %>%
+  summarize(across(.cols = everything(),
+                   list(Avg = mean, Sd = sd))) %>%
+  knitr::kable()
+```
+
+
+## Regression Model: R ~ H
+
+```{r}
+## Model
+fit_lm <- lm(R ~ H, data = d)
+tidy(fit_lm)
+```
+
+
+## tidymodels regression with bootstrapping
+
+**create bootstrap folds**
+
+```{r}
+### 1000 Bootstrap folds
+set.seed(9183)
+boot_samples <- bootstraps(d, times = 1000)
+boot_samples
+```
+
+
+**Fit a linear model to the bootstrap**
+
+```{r}
+fit_boot <-
+  boot_samples %>%
+  mutate(
+    model = map(
+      splits,
+      ~ lm(R ~ H,
+           data = .x)
+    ))
+
+fit_boot
+```
+
+
+**Get the coefficients for each of the corresponding bootstraps**
+
+```{r}
+boot_coefs <- fit_boot %>%
+  mutate(coefs = map(model, tidy))
+
+boot_coefs %>%
+  unnest(coefs)
+```
+
+
+## Uncertainty in the Coefficients
+
+**plot uncertainty**
+
+```{r}
+boot_coefs %>%
+  unnest(coefs) %>%
+  select(term, estimate) %>%
+  ggplot(aes(x = estimate)) +
+  geom_histogram(color = "black",
+                 fill = "grey") +
+  facet_wrap(~term, scales = "free_x") +
+  theme(strip.background = element_rect(fill = "black"),
+        strip.text = element_text(color = "white", face = "bold"))
+```
+
+
+**mean and standard deviation of the bootstraps**
+
+```{r}
+## bootstrapped coefficient's mean and SD
+boot_coefs %>%
+  unnest(coefs) %>%
+  select(term, estimate) %>%
+  group_by(term) %>%
+  summarize(across(.cols = estimate,
+                   list(mean = mean, sd = sd)))
+
+# check results against linear model
+tidy(fit_lm)
+```
+
+
+**exploring the beta coefficients for H**
+
+```{r}
+beta_h <- boot_coefs %>%
+  unnest(coefs) %>%
+  select(term, estimate) %>%
+  filter(term == "H")
+
+beta_h %>%
+  head()
+
+## 90% Quantile Intervals
+quantile(beta_h$estimate, probs = c(0.05, 0.5, 0.95))
+
+
+## 90% Confidence Intervals
+beta_mu <- mean(beta_h$estimate)
+beta_se <- sd(beta_h$estimate)
+
+beta_mu
+beta_se
+
+beta_mu + qnorm(p = c(0.05, 0.95))*beta_se
+
+## can use the built in function from {tidymodels}
+# defaults to a 95% Confidence Interval
+int_pctl(boot_coefs, coefs)
+
+# get 90% Confidence Interval
+int_pctl(boot_coefs, coefs, alpha = 0.1)
+```
+
+
+## Prediction
+
+**Get the bootstrapped coefficients into a wide data frame**
+
+```{r}
+boot_coefs_wide <- boot_coefs %>%
+  unnest(coefs) %>%
+  select(term, estimate) %>%
+  mutate(term = case_when(term == "(Intercept)" ~ "intercept",
+                          TRUE ~ term)) %>%
+  pivot_wider(names_from = term,
+                  values_from = estimate,
+              values_fn = 'list') %>%
+  unnest(cols = everything())
+
+boot_coefs_wide %>%
+  head()
+
+```
+
+
+**A new batter has 95 hits. How many runs would we predict him to have?**
+
+```{r}
+new_H <- 95
+
+new_batter <- boot_coefs_wide %>%
+  mutate(pred_R = intercept + H * new_H)
+
+new_batter
+```
+
+
+**Investigate uncertainty for the new batter with 95 hits**
+
+```{r}
+## plot the distribution of predictions
+new_batter %>%
+  ggplot(aes(x = pred_R)) +
+  geom_histogram(color = "black",
+                 fill = "light grey") +
+  geom_vline(aes(xintercept = mean(pred_R)),
+             color = "red",
+             linetype = "dashed",
+             size = 1.4)
+
+## mean and standard deviation of bootstrap predictions
+new_batter %>%
+  summarize(avg = mean(pred_R),
+            SD = sd(pred_R))
+
+
+## compare to linear model
+predict(fit_lm, newdata = data.frame(H = new_H), se = TRUE)
+```
+
+
+**90% Intervals**
+
+* Quantile & Confidence Intervals
+
+```{r}
+## get a vector of the predicted runs
+pred_runs <- new_batter %>% 
+  pull(pred_R)
+
+## 90% Quantile Intervals
+quantile(pred_runs, probs = c(0.05, 0.5, 0.95))
+
+## 90% Confidence Interval
+mean(pred_runs) + qnorm(p = c(0.025, 0.975)) * sd(pred_runs)
+
+## Compare to 90% confidence intervals from linear model
+predict(fit_lm, newdata = data.frame(H = new_H), interval = "confidence", level = 0.90)
+```
+
+
+* Prediction Intervals
+
+```{r}
+## For prediction intervals we will need the residual standard error (sigma) for each bootstrap model
+boot_sigma <- fit_boot %>%
+  mutate(coefs = map(model, glance)) %>%
+  unnest(coefs) %>%
+  select(id, sigma)
+
+## Get the bootstrap coefficients and the bootstrap id to join the sigma with it
+boot_coefs_sigma <- boot_coefs %>%
+  unnest(coefs) %>%
+  select(id, term, estimate) %>%
+  mutate(term = case_when(term == "(Intercept)" ~ "intercept",
+                          TRUE ~ term)) %>%
+  pivot_wider(names_from = term,
+                  values_from = estimate,
+              values_fn = 'list') %>%
+  unnest(everything()) %>%
+  left_join(boot_sigma)
+
+boot_coefs_sigma %>%
+  head()
+
+## Now make prediction using a random draw with mean = 0 and sd = sigma for model uncertainty
+new_H <- 95
+
+# set seed so that the random draw for model error is replicable
+set.seed(476)
+new_batter2 <- boot_coefs_sigma %>%
+  mutate(pred_R = intercept + H * new_H + rnorm(n = nrow(.), mean = 0, sd = sigma))
+
+new_batter2 %>%
+  head()
+
+## plot the distribution of predictions
+new_batter2 %>%
+  ggplot(aes(x = pred_R)) +
+  geom_histogram(color = "black",
+                 fill = "light grey") +
+  geom_vline(aes(xintercept = mean(pred_R)),
+             color = "red",
+             linetype = "dashed",
+             size = 1.4)
+
+## mean and standard deviation of bootstrap predictions
+new_batter2 %>%
+  summarize(avg = mean(pred_R),
+            SD = sd(pred_R),
+            Low_CL90 = avg - 1.68 * SD,
+            High_CL90 = avg + 1.68 * SD)
+
+## compare to linear model
+predict(fit_lm, newdata = data.frame(H = new_H), interval = "predic", level = 0.9)
+
+```
+
