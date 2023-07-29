@@ -1,0 +1,585 @@
+---
+title: "Workflow Sets Tutorial"
+author: "Patrick Ward"
+date: '2023-07-29'
+output: html_document
+---
+
+## Tidymodels Workflow Sets
+
+* Workflow Sets are a useful method in `tidymodels` for running several machine learning models at one time and then comparing them to each other to find the best model. 
+
+* This tutorial will cover workflow sets for both binary and continuous outcomes.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(tidymodels)
+```
+
+
+## Binary outcomes
+
+**Get Data**
+
+```{r}
+library(mlbench)
+
+data("PimaIndiansDiabetes")
+
+dat <- PimaIndiansDiabetes
+dat %>%
+  head()
+```
+
+
+Create some missing values in the data so that we have something to pre-process
+
+```{r}
+dat[100, "glucose"] <- NA
+dat[c(5, 136, 290, 650), "pressure"] <- NA
+dat[c(79, 250, 333, 710), "triceps"] <- NA
+
+
+dat %>%
+  summarize(across(.cols = everything(),
+                   ~sum(is.na(.x))))
+
+
+## turn diabetes into a 1 or 0
+dat$diabetes_num <- with(dat, as.factor(ifelse(diabetes == "pos", 1, 0)))
+
+dat %>%
+  head()
+
+table(dat$diabetes, dat$diabetes_num)
+prop.table(table(dat$diabetes, dat$diabetes_num))
+```
+
+
+**Train/Test Split**
+
+```{r}
+set.seed(4875)
+dat_split <- initial_split(dat, strata = "diabetes")
+
+train <- training(dat_split)
+test <- testing(dat_split)
+
+train %>%
+  count(diabetes) %>%
+  mutate(pct = n / sum(n))
+
+test %>%
+  count(diabetes) %>%
+  mutate(pct = n / sum(n))
+```
+
+
+**Cross Validation Split**
+
+```{r}
+set.seed(4477)
+cv_folds <- vfold_cv(
+  data = train,
+  v = 5
+)
+
+cv_folds
+```
+
+
+**Model Recipe/Pre-processing**
+
+
+```{r}
+dat_rec <- recipe(diabetes_num ~ ., data = train) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_zv(all_predictors()) %>%
+  update_role(diabetes, new_role = "id variable") %>%
+  themis::step_downsample(diabetes_num) 
+
+dat_rec %>%
+  prep()
+
+dat_rec %>%
+  prep() %>%
+  bake(new_data = NULL)
+```
+
+
+**Set Model Engines**
+
+```{r}
+log_reg <- logistic_reg() %>%
+  set_engine("glm") %>% 
+  set_mode("classification")
+
+svm <- svm_linear(cost = tune(), margin = tune()) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("classification")
+
+xgb <- boost_tree(tree_depth = tune(), learn_rate = tune(), loss_reduction = tune(), 
+             min_n = tune(), sample_size = tune(), trees = tune()) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+dec_tree <- decision_tree(tree_depth=tune(), min_n=tune()) %>%
+  set_engine(engine = "C5.0") %>%
+  set_mode(mode = "classification") 
+```
+
+
+**Workflow Set**
+
+```{r}
+classification_wf <- workflow_set(
+  preproc = list(dat_rec),
+  models = list(log_reg, svm, xgb, dec_tree)
+)
+```
+
+
+**Hyperparameter Tuning**
+
+* set up a grid search
+
+
+```{r}
+doParallel::registerDoParallel(cores = 5)
+
+classification_tuning <- classification_wf %>%  
+  workflow_map(
+    seed = 67, 
+    fn = "tune_grid",
+    grid = 10, # params to pass to tune grid
+    resamples = cv_folds
+  )
+
+doParallel::stopImplicitCluster()
+
+classification_tuning
+
+## plot the model
+classification_tuning %>%
+  autoplot() +
+  theme_minimal() +
+  labs(title='Hyperparameter Tuning Results')
+
+## get the model metrics
+classification_tuning %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  arrange(desc(mean))
+
+## Rank the models
+classification_tuning %>%
+  rank_results(rank_metric = 'roc_auc', select_best = TRUE)
+```
+
+
+* The SVM seems to be the most high performing models according to `roc_auc`. Logistic regression also does well, as does one of the XGBoost trees -- both of those models rank as the two best.
+
+* Occam's Razor would indicate that we should use the logistic regression model since it is easier to interpret. But, let's use the SVM for the purposes of this tutorial.
+
+
+**Extract Workflow for the Model You Want**
+
+If you want the best model according to `roc_auc`
+
+```{r}
+## get the ID for the best model
+best_id <- classification_tuning %>%
+  rank_results(rank_metric = 'roc_auc', select_best = TRUE) %>%
+  slice(1) %>%
+  pull(wflow_id)
+
+
+## extract model workflow
+best_fit <- classification_tuning %>% 
+  extract_workflow(id = best_id)
+
+## get the tuned results for the best model
+xgb_best <- classification_tuning %>%
+  filter(wflow_id == best_id) %>%
+  select(result) %>%
+  pluck(1) %>%
+  pluck(1)
+
+## use the workflow to get the best final model
+xgb_final <- best_fit %>%
+  finalize_workflow(select_best(xgb_best, metric = 'roc_auc'))
+
+## fit the final model to the train and test sets
+doParallel::registerDoParallel(cores = 5)
+
+classification_best_final_fit <- xgb_final %>% 
+  last_fit(
+    split = dat_split
+  )
+
+doParallel::stopImplicitCluster()
+
+classification_best_final_fit
+
+## get test predictions
+test_preds <- collect_predictions(classification_best_final_fit)
+
+# Confusion Matrix
+table(test_preds$.pred_class, test_preds$diabetes_num)
+
+
+## Variable Importance Factor on Training Set
+xgb_final %>%
+  fit(data = train) %>%
+  extract_fit_parsnip() %>%
+  vip::vip()
+
+## Save the final workflow to deploy later
+best_wf_model <- extract_workflow(classification_best_final_fit)
+best_wf_model
+
+# save(best_wf_model, file = "best_wf_model.rda")
+```
+
+
+If you want the best SVM model
+
+```{r}
+## get the ID for the SVM model
+svm_id <- classification_tuning %>%
+  filter(wflow_id == "recipe_svm_linear") %>%
+  pull(wflow_id)
+
+
+## extract model workflow
+svm_fit <- classification_tuning %>% 
+  extract_workflow(id = svm_id)
+
+## get the tuned results for the best model
+svm_best <- classification_tuning %>%
+  filter(wflow_id == svm_id) %>%
+  select(result) %>%
+  pluck(1) %>%
+  pluck(1)
+
+## use the workflow to get the best final model
+svm_final <- svm_fit %>%
+  finalize_workflow(select_best(svm_best, metric = 'roc_auc'))
+
+## fit the final model to the train and test sets
+doParallel::registerDoParallel(cores = 5)
+
+classification_svm_final_fit <- svm_final %>% 
+  last_fit(
+    split = dat_split
+  )
+
+doParallel::stopImplicitCluster()
+
+classification_svm_final_fit
+
+# get test predictions
+svm_test_preds <- collect_predictions(classification_svm_final_fit)
+
+# Confusion Matrix
+table(svm_test_preds$.pred_class, svm_test_preds$diabetes_num)
+
+## ROC Curve
+library(pROC)
+
+# AUC
+roc(response = test_preds$diabetes_num,
+         predictor = test_preds$.pred_1)$auc
+
+# ROC Plot
+plot(roc(response = test_preds$diabetes_num,
+         predictor = test_preds$.pred_1))
+
+# Evaluating cutoffs
+proc <- plot(roc(response = test_preds$diabetes_num,
+         predictor = test_preds$.pred_1))
+
+coords(proc, x = "best", best.method = "youden")
+
+## Calibration plot
+test_preds %>% 
+  ggplot(aes(x = .pred_1, y = as.numeric(as.character(diabetes_num)))) +
+  geom_smooth() +
+  geom_abline(intercept = 0,
+              slope = 1,
+              color = "red")
+
+## Save the final workflow to deploy later
+svm_wf_model <- extract_workflow(classification_svm_final_fit)
+svm_wf_model
+
+# save(best_wf_model, file = "best_wf_model.rda")
+```
+
+
+**Load new data and make predictions**
+
+```{r}
+new_obs <- dat[290, ]
+new_obs
+
+predict(best_wf_model, new_data = new_obs, type = "prob")
+predict(best_wf_model, new_data = new_obs, type = "class")
+
+predict(svm_wf_model, new_data = new_obs, type = "prob")
+predict(svm_wf_model, new_data = new_obs, type = "class")
+```
+
+
+## Continuous outcomes
+
+**Get Data**
+
+```{r}
+dat <- mtcars
+
+dat %>%
+  head()
+```
+
+
+Create some missing values in the data so that we have something to pre-process
+
+```{r}
+dat[12, "hp"] <- NA
+dat[c(12, 28, 3), "wt"] <- NA
+
+dat %>%
+  summarize(across(.cols = everything(),
+                   ~sum(is.na(.x))))
+
+# Turn cyl, vs, am, gear, carb
+dat <- dat %>%
+  mutate(cyl = as.factor(as.character(cyl)),
+         vs = as.factor(as.character(cyl)),
+         am = as.factor(as.character(am)),
+         gear = as.factor(as.character(gear)),
+         carb = as.factor(as.character(carb)))
+
+dat %>%
+  str()
+```
+
+
+**Train/Test Split**
+
+```{r}
+set.seed(8575)
+dat_split <- initial_split(dat)
+
+train <- training(dat_split)
+test <- testing(dat_split)
+
+train %>%
+  head()
+
+test %>%
+  head()
+```
+
+
+**Cross Validation Folds**
+
+```{r}
+set.seed(8836)
+cv_folds <- vfold_cv(
+  data = train, 
+  v = 5
+  ) 
+
+cv_folds
+```
+
+
+
+**Model Recipe/Pre-processing**
+
+
+```{r}
+dat_rec <- recipe(mpg ~ ., data = train) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_zv(all_predictors())
+
+dat_rec %>%
+  prep()
+
+dat_rec %>%
+  prep() %>%
+  bake(new_data = NULL)
+```
+
+
+
+**Set Model Engines**
+
+```{r}
+lm_reg <- linear_reg() %>%
+  set_engine("lm") %>% 
+  set_mode("regression")
+
+svm <- svm_linear(cost = tune()) %>% 
+  set_engine("kernlab") %>% 
+  set_mode("regression")
+
+rf <- rand_forest(mtry = tune(), trees = tune()) %>% 
+  set_engine("randomForest") %>% 
+  set_mode("regression")
+
+dec_tree <- decision_tree(tree_depth=tune()) %>%
+  set_engine(engine = "rpart") %>%
+  set_mode(mode = "regression") 
+```
+
+
+**Workflow Set**
+
+```{r}
+mpg_wf <- workflow_set(
+  preproc = list(dat_rec),
+  models = list(lm_reg, svm, rf, dec_tree)
+)
+```
+
+
+**Hyperparameter Tuning**
+
+* set up a grid search
+
+
+```{r}
+doParallel::registerDoParallel(cores = 5)
+
+model_tuning <- mpg_wf %>%  
+  workflow_map(
+    seed = 67, 
+    fn = "tune_grid",
+    grid = 10, # params to pass to tune grid
+    resamples = cv_folds
+  )
+
+doParallel::stopImplicitCluster()
+
+model_tuning
+
+## plot the model
+model_tuning %>%
+  autoplot() +
+  theme_minimal() +
+  labs(title='Hyperparameter Tuning Results')
+
+## get the model metrics
+model_tuning %>%
+  collect_metrics() %>%
+  filter(.metric == "rmse") %>%
+  arrange(desc(mean))
+
+## Rank the models
+model_tuning %>%
+  rank_results(rank_metric = 'rmse', select_best = TRUE)
+```
+
+
+* Random Forest was the best model according to RMSE
+
+**Extract Workflow for the Best Model**
+
+
+```{r}
+## get the ID for the best model
+best_id <- model_tuning %>%
+  rank_results(rank_metric = 'rmse', select_best = TRUE) %>%
+  slice(1) %>%
+  pull(wflow_id)
+
+
+## extract model workflow
+best_fit <- model_tuning %>% 
+  extract_workflow(id = best_id)
+
+## get the tuned results for the best model
+rf_best <- model_tuning %>%
+  filter(wflow_id == best_id) %>%
+  select(result) %>%
+  pluck(1) %>%
+  pluck(1)
+
+## use the workflow to get the best final model
+rf_final <- best_fit %>%
+  finalize_workflow(select_best(rf_best, metric = 'rmse'))
+
+## fit the final model to the train and test sets
+doParallel::registerDoParallel(cores = 5)
+
+best_final_fit <- rf_final %>% 
+  last_fit(
+    split = dat_split
+  )
+
+doParallel::stopImplicitCluster()
+
+best_final_fit
+
+## get test predictions
+test_preds <- collect_predictions(best_final_fit)
+
+## plot predicted and actual values
+test_preds %>%
+  ggplot(aes(x = .pred, y = mpg)) +
+  geom_point(size = 5,
+             shape = 21,
+             color = "black",
+             fill = "green") +
+  geom_abline(intercept = 0, 
+              slope = 1, 
+              linetype = "dashed",
+              color = "red",
+              size = 1.1)
+
+## plot fitted vs residuals
+test_preds %>%
+  mutate(resid = mpg - .pred) %>%
+  ggplot(aes(x = .pred, y = resid)) +
+  geom_point(size = 5,
+             shape = 21,
+             color = "black",
+             fill = "green") +
+  geom_hline(yintercept = 0, 
+              slope = 1, 
+              linetype = "dashed",
+              color = "red",
+              size = 1.1)
+
+## Variable Importance Factor on Training Set
+rf_final %>%
+  fit(data = train) %>%
+  extract_fit_parsnip() %>%
+  vip::vip()
+
+## Save the final workflow to deploy later
+best_rf_wf_model <- extract_workflow(best_final_fit)
+best_rf_wf_model
+
+# save(best_rf_wf_model, file = "best_wf_model.rda")
+```
+
+
+
+**Load new data and make predictions**
+
+```{r}
+new_obs <- dat[12, ]
+new_obs
+
+predict(best_rf_wf_model, new_data = new_obs)
+predict(best_rf_wf_model, new_data = new_obs)
+
+```
+
